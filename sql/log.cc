@@ -8699,8 +8699,6 @@ err:
           change has already become visible to other connections on the master
           when it is binlogged.
 
-          ToDo: If semi-sync is enabled, obtain the binlog coords from the
-          engine to be waited for later at after-commit.
         */
         mysql_mutex_lock(&LOCK_after_binlog_sync);
         mysql_mutex_unlock(&LOCK_log);
@@ -8722,6 +8720,20 @@ err:
                      (file, engine_context, commit_gtid)))
             goto engine_fail;
         status_var_add(thd->status_var.binlog_bytes_written, binlog_total_bytes);
+
+#ifdef HAVE_REPLICATION
+        if (unlikely(repl_semisync_master->get_master_enabled()))
+        {
+          char buf[FN_REFLEN];
+          (*opt_binlog_engine_hton->get_filename)
+            (buf, engine_context->out_file_no);
+          if (unlikely(repl_semisync_master->
+                       report_binlog_update(thd, thd, buf,
+                                            (my_off_t)engine_context->out_offset,
+                                            commit_gtid)))
+            sql_print_error("Failed to run 'after_flush' hooks");
+        }
+#endif
 
         goto engine_ok;
       engine_fail:
@@ -10291,6 +10303,32 @@ MYSQL_BIN_LOG::write_transaction_to_binlog_events(group_commit_entry *entry)
       }
     }
 
+#ifdef HAVE_REPLICATION
+    /*
+      For --binlog-storage-engine, call report_binlog_update() now that the
+      engine write has produced valid binlog positions.
+    */
+    if (opt_binlog_engine_hton &&
+        unlikely(repl_semisync_master->get_master_enabled()) &&
+        likely(!entry->error))
+    {
+      char buf[FN_REFLEN];
+      (*opt_binlog_engine_hton->get_filename)
+        (buf, cache_mngr->last_commit_pos_file.engine_file_no);
+      if (unlikely(repl_semisync_master->
+                   report_binlog_update(entry->thd, entry->thd, buf,
+                                        (my_off_t)cache_mngr->
+                                        last_commit_pos_offset,
+                                        entry->thd->
+                                        get_last_commit_gtid())))
+      {
+        entry->error= ER_ERROR_ON_WRITE;
+        entry->commit_errno= -1;
+        entry->error_cache= NULL;
+      }
+    }
+#endif
+
     group_commit_entry *next= entry->next;
     if (!next)
     {
@@ -10545,8 +10583,14 @@ MYSQL_BIN_LOG::trx_group_commit_leader(group_commit_entry *leader)
     else
     {
 #ifdef HAVE_REPLICATION
-      if (unlikely(repl_semisync_master->get_master_enabled()))
+      if (!opt_binlog_engine_hton &&
+          unlikely(repl_semisync_master->get_master_enabled()))
       {
+        /*
+          For --binlog-storage-engine, the engine binlog positions are not
+          available yet at this point; report_binlog_update() is called later
+          after the engine write in the commit_ordered stage.
+        */
         DEBUG_SYNC(leader->thd, "commit_before_update_binlog_end_pos");
         bool any_error= false;
 
@@ -10784,6 +10828,34 @@ MYSQL_BIN_LOG::trx_group_commit_leader(group_commit_entry *leader)
         }
       }
     }
+
+#ifdef HAVE_REPLICATION
+    /*
+      For --binlog-storage-engine, call report_binlog_update() now that the
+      engine write has produced valid binlog positions. This must happen before
+      the thread is woken up (so thd->semisync_info is set before
+      wait_after_commit() reads it).
+    */
+    if (opt_binlog_engine_hton &&
+        unlikely(repl_semisync_master->get_master_enabled()) &&
+        likely(!current->error))
+    {
+      char buf[FN_REFLEN];
+      (*opt_binlog_engine_hton->get_filename)
+        (buf, cache_mngr->last_commit_pos_file.engine_file_no);
+      if (unlikely(repl_semisync_master->
+                   report_binlog_update(current->thd, current->thd, buf,
+                                        (my_off_t)cache_mngr->
+                                        last_commit_pos_offset,
+                                        current->thd->
+                                        get_last_commit_gtid())))
+      {
+        current->error= ER_ERROR_ON_WRITE;
+        current->commit_errno= -1;
+        current->error_cache= NULL;
+      }
+    }
+#endif
 
     current->thd->wakeup_subsequent_commits(current->error);
 

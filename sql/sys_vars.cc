@@ -3730,12 +3730,6 @@ Replicate_events_marked_for_skip
 static bool
 check_rpl_semi_sync_master_enabled(sys_var *self, THD *thd, set_var *var)
 {
-  if (opt_binlog_engine_hton && var->save_result.ulonglong_value)
-  {
-    my_error(ER_NOT_YET_SUPPORTED_ENGINE_BINLOG, MYF(0),
-             "Semi-synchronous replication");
-    return true;
-  }
   return false;
 }
 

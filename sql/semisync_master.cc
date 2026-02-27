@@ -18,6 +18,7 @@
 
 #include <my_global.h>
 #include "semisync_master.h"
+#include "mysqld.h"
 #include <algorithm>
 #include <mysql_com.h>
 
@@ -976,7 +977,8 @@ int Repl_semi_sync_master::wait_after_commit(THD* thd, bool all)
 
   if (is_real_trans &&
       got_info &&
-      wait_point() == SEMI_SYNC_MASTER_WAIT_POINT_AFTER_STORAGE_COMMIT)
+      (wait_point() == SEMI_SYNC_MASTER_WAIT_POINT_AFTER_STORAGE_COMMIT ||
+       opt_binlog_engine_hton))
     ret= commit_trx(log_info);
 
   if (is_real_trans && got_info)
