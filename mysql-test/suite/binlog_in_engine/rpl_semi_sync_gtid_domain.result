@@ -1,0 +1,164 @@
+include/master-slave.inc
+[connection master]
+connection master;
+call mtr.add_suppression("Timeout waiting for reply of binlog");
+call mtr.add_suppression("Read semi-sync reply");
+call mtr.add_suppression("mysqld: Got an error reading communication packets");
+call mtr.add_suppression("Semi-sync master failed on net_flush");
+connection slave;
+set sql_log_bin=0;
+call mtr.add_suppression("Semi-sync slave .* reply");
+set sql_log_bin=1;
+connection master;
+#
+# Setup semi-sync on master and slave
+#
+set @save_master_timeout= @@global.rpl_semi_sync_master_timeout;
+set @save_master_enabled= @@global.rpl_semi_sync_master_enabled;
+set @save_master_wait_no_slave= @@global.rpl_semi_sync_master_wait_no_slave;
+set @save_gtid_domain_id= @@session.gtid_domain_id;
+set global rpl_semi_sync_master_timeout= 10000;
+set global rpl_semi_sync_master_enabled= 1;
+connection slave;
+set @save_slave_enabled= @@global.rpl_semi_sync_slave_enabled;
+include/stop_slave.inc
+set global rpl_semi_sync_slave_enabled= 1;
+include/start_slave.inc
+connection master;
+show status like 'Rpl_semi_sync_master_status';
+Variable_name	Value
+Rpl_semi_sync_master_status	ON
+show status like 'Rpl_semi_sync_master_clients';
+Variable_name	Value
+Rpl_semi_sync_master_clients	1
+#
+# Test 1: Transactions in different GTID domains (group commit path)
+#
+CREATE TABLE t1 (a INT PRIMARY KEY, b VARCHAR(100)) ENGINE=InnoDB;
+SET SESSION gtid_domain_id= 1;
+INSERT INTO t1 VALUES (1, 'domain1_row1');
+INSERT INTO t1 VALUES (2, 'domain1_row2');
+SET SESSION gtid_domain_id= 2;
+INSERT INTO t1 VALUES (3, 'domain2_row1');
+INSERT INTO t1 VALUES (4, 'domain2_row2');
+SET SESSION gtid_domain_id= 3;
+INSERT INTO t1 VALUES (5, 'domain3_row1');
+include/save_master_gtid.inc
+connection slave;
+include/sync_with_master_gtid.inc
+connection master;
+Multi-domain DML semi-sync acks: 5 (should be >= 5)
+show status like 'Rpl_semi_sync_master_no_tx';
+Variable_name	Value
+Rpl_semi_sync_master_no_tx	0
+#
+# Test 2: DDL in different domains (non-group-commit direct path)
+#
+SET SESSION gtid_domain_id= 10;
+CREATE TABLE t2 (a INT) ENGINE=InnoDB;
+SET SESSION gtid_domain_id= 20;
+CREATE TABLE t3 (a INT) ENGINE=InnoDB;
+SET SESSION gtid_domain_id= 10;
+DROP TABLE t2;
+SET SESSION gtid_domain_id= 20;
+DROP TABLE t3;
+include/save_master_gtid.inc
+connection slave;
+include/sync_with_master_gtid.inc
+connection master;
+Multi-domain DDL semi-sync acks: 4 (should be >= 4)
+#
+# Test 3: Interleaved transactions across many domains
+#
+include/save_master_gtid.inc
+connection slave;
+include/sync_with_master_gtid.inc
+connection master;
+Interleaved multi-domain acks: 30 (should be >= 30)
+show status like 'Rpl_semi_sync_master_no_tx';
+Variable_name	Value
+Rpl_semi_sync_master_no_tx	0
+#
+# Test 4: Verify GTID position contains all domains
+#
+connection master;
+# Master GTID position should contain multiple domain entries:
+@@gtid_binlog_pos: 0-1-11,1-1-8,2-1-8,3-1-7,4-1-6,10-1-2,20-1-2
+connection slave;
+# Slave GTID position should match:
+@@gtid_slave_pos: 0-1-11,1-1-8,2-1-8,3-1-7,4-1-6,10-1-2,20-1-2
+#
+# Test 5: Switch domains and verify semi-sync still works after reconnect
+#
+include/stop_slave.inc
+include/start_slave.inc
+connection master;
+SET SESSION gtid_domain_id= 100;
+INSERT INTO t1 VALUES (200, 'domain100_after_reconnect');
+SET SESSION gtid_domain_id= 200;
+INSERT INTO t1 VALUES (201, 'domain200_after_reconnect');
+include/save_master_gtid.inc
+connection slave;
+include/sync_with_master_gtid.inc
+connection master;
+Post-reconnect multi-domain acks: 2 (should be >= 2)
+show status like 'Rpl_semi_sync_master_status';
+Variable_name	Value
+Rpl_semi_sync_master_status	ON
+#
+# Test 6: Verify data integrity on slave
+#
+connection slave;
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+37
+# Verify some rows from each domain:
+SELECT a, b FROM t1 WHERE b LIKE 'domain1%' ORDER BY a;
+a	b
+1	domain1_row1
+2	domain1_row2
+101	domain1_load
+106	domain1_load
+111	domain1_load
+116	domain1_load
+121	domain1_load
+126	domain1_load
+200	domain100_after_reconnect
+SELECT a, b FROM t1 WHERE b LIKE 'domain2%' ORDER BY a;
+a	b
+3	domain2_row1
+4	domain2_row2
+102	domain2_load
+107	domain2_load
+112	domain2_load
+117	domain2_load
+122	domain2_load
+127	domain2_load
+201	domain200_after_reconnect
+SELECT a, b FROM t1 WHERE b LIKE 'domain3%' ORDER BY a;
+a	b
+5	domain3_row1
+103	domain3_load
+108	domain3_load
+113	domain3_load
+118	domain3_load
+123	domain3_load
+128	domain3_load
+#
+# Cleanup
+#
+connection master;
+SET SESSION gtid_domain_id= @save_gtid_domain_id;
+DROP TABLE t1;
+include/save_master_gtid.inc
+connection slave;
+include/sync_with_master_gtid.inc
+connection slave;
+include/stop_slave.inc
+set global rpl_semi_sync_slave_enabled= @save_slave_enabled;
+include/start_slave.inc
+connection master;
+set global rpl_semi_sync_master_enabled= @save_master_enabled;
+set global rpl_semi_sync_master_timeout= @save_master_timeout;
+set global rpl_semi_sync_master_wait_no_slave= @save_master_wait_no_slave;
+include/rpl_end.inc
